@@ -64,11 +64,14 @@ SUBSCRIPTIONS = [
     {"id": "sub-du-status",          "type": "ValueChange",    "path": "Device.SoftwareModules.DeploymentUnit.", "category": "dac"},
     {"id": "sub-eu-status",          "type": "ValueChange",    "path": "Device.SoftwareModules.ExecutionUnit.",  "category": "dac"},
     # System
-    {"id": "sub-device-boot",        "type": "Event",          "path": "Device.",                         "category": "system"},
+    {"id": "sub-device-boot",        "type": "Event",          "path": "Device.Boot!",                    "category": "system"},
     {"id": "sub-sw-version",         "type": "ValueChange",    "path": "Device.DeviceInfo.SoftwareVersion","category": "system"},
     # Network
     {"id": "sub-ip-status",          "type": "ValueChange",    "path": "Device.IP.Interface.",            "category": "network"},
     {"id": "sub-eth-status",         "type": "ValueChange",    "path": "Device.Ethernet.Interface.",      "category": "network"},
+    # IP Layer Capacity (UDPST / TR-471) — incremental results + test completion
+    {"id": "sub-iplayer-incremental", "type": "Event",          "path": "Device.IP.Diagnostics.",         "category": "network", "required": False},
+    {"id": "sub-iplayer-complete",    "type": "OperationComplete", "path": "Device.IP.Diagnostics.",      "category": "network", "required": False},
 ]
 
 # Map notif type string -> human-readable titles / severity
@@ -95,6 +98,8 @@ _NOTIF_META = {
     "sub-sw-version":         {"title": "Software Version Changed",         "severity": "info"},
     "sub-ip-status":          {"title": "IP Interface Status Changed",      "severity": "info"},
     "sub-eth-status":         {"title": "Ethernet Interface Status Changed","severity": "info"},
+    "sub-iplayer-incremental":{"title": "IPLayerCapacity Incremental Result","severity": "info"},
+    "sub-iplayer-complete":   {"title": "IPLayerCapacity Test Complete",     "severity": "success"},
 }
 
 
@@ -629,6 +634,24 @@ class USPEventListener:
         elif "TransferComplete" in event_name:
             title = "File Transfer Completed"
             severity = "success"
+        elif "IPLayerCapacityIncrementalResult" in event_name:
+            title = "IPLayerCapacity Incremental Result"
+            severity = "info"
+            # Parse numeric fields out of the string-typed params map
+            def _f(k): 
+                try: return float(params.get(k, 0))
+                except: return 0.0
+            params = {
+                "IPLayerCapacity":   _f("IPLayerCapacity"),
+                "LossRatio":         _f("LossRatio"),
+                "RTTRange":          _f("RTTRange"),
+                "PDVRange":          _f("PDVRange"),
+                "MinOnewayDelay":    _f("MinOnewayDelay"),
+                "ReorderedRatio":    _f("ReorderedRatio"),
+                "ReplicatedRatio":   _f("ReplicatedRatio"),
+                "TimeOfSubInterval": params.get("TimeOfSubInterval", ""),
+                "raw": dict(ev.params),
+            }
 
         event = {
             "id": f"evt-{uuid.uuid4().hex}",

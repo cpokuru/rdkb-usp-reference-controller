@@ -53,7 +53,7 @@ from google.protobuf.json_format import MessageToJson
 
 message_number = 1
 
-timeout_seconds = 2 # Set your timeout (n) seconds here
+timeout_seconds = 10 # Async operate responses may take a few seconds
 
 
 def STDERR(*args, **kwargs):
@@ -258,32 +258,26 @@ def on_connect(client, userdata, flags, rc, properties=None):
                 # Split the command from 'operate' and the rest of the command
                 _, command_with_args = full_command.split(' ', 1)
 
-                # Initialize input_args as an empty dictionary by default
+                # TR-369 spec: operate_msg.command must be the bare path "Obj.Method()"
+                # and input_args carries the key-value pairs as plain strings (no quotes).
                 input_args = {}
 
-                # Check if there are arguments by looking for '(' and ')'
                 if '(' in command_with_args and command_with_args.endswith(')'):
-                    # Split the command from the arguments
                     command, args_str = command_with_args.split('(', 1)
-                    args_str = args_str.rstrip(')')  # Remove the closing parenthesis
-
-                    # Check if args_str is not empty to parse arguments
+                    args_str = args_str.rstrip(')')
                     if args_str:
-                        # Parse the arguments into a dictionary
                         for arg in args_str.split(','):
                             key, value = arg.split('=', 1)
-                            input_args[key.strip()] = value.strip()
-
-                    # Include '()' to ensure command consistency
+                            value = value.strip()
+                            # Strip surrounding double-quotes (UspPa shell-style quoting)
+                            if value.startswith('"') and value.endswith('"'):
+                                value = value[1:-1]
+                            input_args[key.strip()] = value
                     command += '()'
                 else:
-                    # Assume no arguments were provided if '(' or ')' are missing or incorrect
-                    command = command_with_args  # Use the command as is, it should already include '()'
-                
-                # Now, you have the command and input_args ready to use
-                command_key = "unique_command_key"  # You might need a unique command key here
-                
-                # Example call to send_operate_message() with the parsed command and input_args
+                    command = command_with_args
+
+                command_key = "unique_command_key"
                 send_operate_message(command, command_key, input_args)
             else:
                 STDERR("unknown message")
@@ -326,7 +320,7 @@ def on_message(client, userdata, msg):
             # Handling different message types
             if msg_type == usp_msg.Header.ERROR:
                 STDERR("Handling ERROR message")
-                # Handle ERROR message
+                STDOUT(MessageToJson(in_usp_msg.body.error))
             elif msg_type == usp_msg.Header.GET:
                 STDERR("Handling GET message")
                 # Handle GET message

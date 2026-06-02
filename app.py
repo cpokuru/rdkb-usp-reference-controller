@@ -57,7 +57,7 @@ class USPController:
     def __init__(self):
         # Default configuration - matching your existing pattern
         self.config = {
-            'broker': "10.2.175.86",
+            'broker': "10.26.69.240",
             'broker_port': "1883",
             'broker_topic': "/usp/controller",
             'broker_agent': "/usp/agent",
@@ -89,6 +89,12 @@ class USPController:
         }
         self._events_lock = threading.Lock()
         self._model_lock = threading.Lock()
+
+        # IPLayerCapacity / UDPST in-memory result store
+        self._iplayer_lock = threading.Lock()
+        self._iplayer_results: List[Dict] = []   # incremental results as they arrive
+        self._iplayer_summary: Dict = {}          # final summary from OperationComplete
+        self._iplayer_running: bool = False       # True while test is in progress
         
         # MQTT USP Client path - matching your existing setup
         self.mqtt_client_path = './mqtt-usp-client.py'
@@ -100,7 +106,7 @@ class USPController:
             "local": "file:///opt/resident-container-images/",
             "share": "file:///share/",
             "remote": "https://raw.githubusercontent.com/robvogelaar/robvogelaar.github.io/main/unlisted/dac-images/",
-            "server": "http://10.26.60.86/"
+            "server": "http://10.26.69.240/"
         }
         
         # Initialize on startup
@@ -1422,7 +1428,7 @@ class USPController:
                 "local": "file:///opt/resident-container-images/",
                 "share": "file:///share/",
                 "remote": "https://raw.githubusercontent.com/robvogelaar/robvogelaar.github.io/main/unlisted/dac-images/",
-                "server": "http://10.26.60.86/"
+                "server": "http://10.26.69.240/"
             }
             
             # Validate inputs - matching your validation logic
@@ -1976,6 +1982,232 @@ class USPController:
             self.log(f"iot_metadata_read error: {e}")
             return {"success": False, "error": "IoT metadata read failed", "uri": uri}
 
+    # ── IP Layer Capacity Diagnostics (UDPST / TR-471) ────────────────────────
+
+    def _discover_iplayer_instance(self) -> int:
+        """
+        Discover which instance of Device.IP.Diagnostics.IPLayerCapacity.{i}. exists.
+        Returns the instance number (almost always 1). Falls back to 1 if GET fails.
+        """
+        try:
+            result = self.usp_pa("get", "Device.IP.Diagnostics.IPLayerCapacity.", quiet=True)
+            if result:
+                for item in result:
+                    rpath = item.get("resolvedPath", "")
+                    # e.g. "Device.IP.Diagnostics.IPLayerCapacity.1."
+                    import re as _re
+                    m = _re.search(r'IPLayerCapacity\.(\d+)\.', rpath)
+                    if m:
+                        inst = int(m.group(1))
+                        self.log(f"IPLayerCapacity instance discovered: {inst}")
+                        return inst
+        except Exception as e:
+            self.log(f"IPLayerCapacity instance discovery error: {e}")
+        self.log("IPLayerCapacity: defaulting to instance 1")
+        return 1
+
+    def run_iplayer_capacity(self, params: Dict[str, str]) -> Dict[str, Any]:
+        """
+        Send Device.IP.Diagnostics.IPLayerCapacity() operate command, then
+        start a background thread that polls Device.IP.Diagnostics.IPLayerCapacity.
+        every second to harvest IncrementalResult.{i}. rows and the final summary.
+
+        IPLayerCapacityIncrementalResult! is an rbus event consumed internally by
+        obuspa — it does NOT arrive via USP NOTIFY.  Polling the GET path is the
+        correct way to read results from a USP controller.
+
+        Accepted *params* keys (all optional, shown with defaults):
+          ServerList, Role, ProtocolVersion, IPDVEnable, IPRREnable, RIPREnable,
+          MaximumTestBandwidth, NumberTestSubIntervals,
+          NumberFirstModeTestSubIntervals, TestSubInterval,
+          StatusFeedbackInterval, RateAdjAlgorithm
+        """
+        defaults = {
+            "ServerList":                      "10.26.69.240:25000",
+            "Role":                            "Receiver",
+            "ProtocolVersion":                 "IPv4",
+            "IPDVEnable":                      "true",
+            "IPRREnable":                      "true",
+            "RIPREnable":                      "true",
+            "MaximumTestBandwidth":            "1000",
+            "NumberTestSubIntervals":          "10",
+            "NumberFirstModeTestSubIntervals": "0",
+            "TestSubInterval":                 "1000",
+            "StatusFeedbackInterval":          "50",
+            "RateAdjAlgorithm":                "B",
+        }
+        merged = {**defaults, **{k: v for k, v in params.items() if v}}
+        # Build arg string with UspPa-style quoting so mqtt-usp-client.py can strip them
+        # and deliver plain values into the protobuf input_args map.
+        _BARE = {"true", "false"}
+        def _fmt(k, v):
+            s = str(v)
+            if s.lower() in _BARE: return f"{k}={s}"
+            try: int(s); return f"{k}={s}"
+            except ValueError: return f'{k}="{s}"'
+        arg_str = ",".join(_fmt(k, v) for k, v in merged.items())
+
+        # UspPa targets Device.IP.Diagnostics.IPLayerCapacity() — no instance number.
+        # The vendor handler (udpst_rbus_datamodel.c) registers the command at the
+        # table level, not per-instance.  Matching the exact UspPa form that works.
+        cmd = f"Device.IP.Diagnostics.IPLayerCapacity({arg_str})"
+        base_path = "Device.IP.Diagnostics.IPLayerCapacity."
+        self.log(f"IPLayerCapacity operate: {cmd}")
+
+        # Estimate test duration so we know when to stop polling
+        try:
+            n_intervals = int(merged.get("NumberTestSubIntervals", 10))
+            interval_ms = int(merged.get("TestSubInterval", 1000))
+            # Allow 2× headroom for mode-1 ramp-up + network latency
+            est_duration = (n_intervals * interval_ms / 1000) * 2 + 10
+        except Exception:
+            est_duration = 120
+
+        # Clear previous results
+        with self._iplayer_lock:
+            self._iplayer_results.clear()
+            self._iplayer_summary = {}
+            self._iplayer_running = True
+
+        result = self.usp_pa("operate", cmd)
+        if result:
+            # Check for cmdFailure — real failure
+            try:
+                op = result.get("operationResults", [{}])[0]
+                if "cmdFailure" in op:
+                    err = op["cmdFailure"]
+                    with self._iplayer_lock:
+                        self._iplayer_running = False
+                    self.log(f"IPLayerCapacity rejected: {err}")
+                    return {"success": False, "error": err.get("errMsg", "Unknown error"), "command": cmd}
+            except Exception:
+                pass
+            self.log("IPLayerCapacity command accepted — starting result poller")
+        else:
+            # No response (timeout) — the async operate may still have started.
+            # The USPEventListener will receive the OperationComplete notification
+            # directly. Start the poller anyway; events are the source of truth.
+            self.log("IPLayerCapacity: no OPERATE_RESP (timeout) — starting poller anyway (events-driven)")
+
+        # Launch background thread to poll incremental results via GET
+        t = threading.Thread(
+            target=self._iplayer_poll_loop,
+            args=(est_duration, base_path),
+            daemon=True,
+            name="IPLayerPoller",
+        )
+        t.start()
+        return {"success": True, "command": cmd,
+                "result": result or {"note": "async_started_no_resp"},
+                "est_duration_sec": est_duration}
+
+    def _iplayer_poll_loop(self, max_duration: float, poll_path: str = "Device.IP.Diagnostics.IPLayerCapacity.1."):
+        """
+        Background thread: polls the IPLayerCapacity instance via USP GET
+        every second until Status=Complete or timeout.
+
+        The IncrementalResult.{i}. sub-table is populated by obuspa as the test
+        progresses.  We track how many rows we've already seen and append new ones.
+        """
+        deadline = time.time() + max_duration
+        seen_count = 0
+        self.log(f"IPLayerCapacity poller started — path={poll_path} max={max_duration:.0f}s")
+
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                result = self.usp_pa("get", poll_path, quiet=True)
+                if not result:
+                    continue
+
+                # Collect all params from all resolved paths
+                flat: Dict[str, str] = {}
+                for item in result:
+                    rpath = item.get("resolvedPath", "")
+                    for k, v in item.get("resultParams", {}).items():
+                        flat[f"{rpath}{k}" if rpath else k] = str(v)
+
+                # Check Status
+                status = ""
+                for k, v in flat.items():
+                    if k.endswith(".Status") or k == "Status":
+                        status = v
+                        break
+
+                # Pull top-level summary fields
+                summary_keys = {
+                    "Status", "MaxIPLayerCapacity", "TimeOfMax",
+                    "MaxETHCapacityNoFCS", "MaxETHCapacityWithFCS",
+                    "IPLayerCapacitySummary", "LossRatioSummary",
+                    "PDVRangeSummary", "BOMTime", "EOMTime",
+                    "IncrementalResultNumberOfEntries",
+                }
+                summary: Dict[str, str] = {}
+                for k, v in flat.items():
+                    bare = k.split(".")[-1]
+                    if bare in summary_keys:
+                        summary[bare] = v
+
+                # Parse IncrementalResult rows we haven't seen yet
+                # Keys look like: Device.IP.Diagnostics.IPLayerCapacity.IncrementalResult.3.IPLayerCapacity
+                incremental: Dict[int, Dict[str, str]] = {}
+                for full_key, v in flat.items():
+                    if "IncrementalResult." not in full_key:
+                        continue
+                    parts = full_key.split("IncrementalResult.")
+                    if len(parts) < 2:
+                        continue
+                    rest = parts[1]  # e.g. "3.IPLayerCapacity"
+                    idx_str, _, field = rest.partition(".")
+                    try:
+                        idx = int(idx_str)
+                    except ValueError:
+                        continue
+                    if idx not in incremental:
+                        incremental[idx] = {}
+                    incremental[idx][field] = v
+
+                # Append new rows (sorted by index)
+                new_rows = []
+                for idx in sorted(incremental.keys()):
+                    if idx > seen_count:
+                        row = incremental[idx]
+                        try:
+                            new_rows.append({
+                                "index":           idx,
+                                "IPLayerCapacity": float(row.get("IPLayerCapacity", 0)),
+                                "LossRatio":       float(row.get("LossRatio", 0)),
+                                "RTTRange":        float(row.get("RTTRange", 0)),
+                                "PDVRange":        float(row.get("PDVRange", 0)),
+                                "MinOnewayDelay":  float(row.get("MinOnewayDelay", 0)),
+                                "ReorderedRatio":  float(row.get("ReorderedRatio", 0)),
+                                "ReplicatedRatio": float(row.get("ReplicatedRatio", 0)),
+                                "TimeOfSubInterval": row.get("TimeOfSubInterval", ""),
+                            })
+                            seen_count = idx
+                        except Exception:
+                            pass
+
+                with self._iplayer_lock:
+                    self._iplayer_results.extend(new_rows)
+                    if summary:
+                        self._iplayer_summary.update(summary)
+
+                if new_rows:
+                    self.log(f"IPLayerCapacity: +{len(new_rows)} incremental results "
+                             f"(total {seen_count}), Status={status!r}")
+
+                if status in ("Complete", "Error", "None"):
+                    self.log(f"IPLayerCapacity test finished: Status={status}")
+                    break
+
+            except Exception as exc:
+                self.log(f"IPLayerCapacity poller error: {exc}")
+
+        with self._iplayer_lock:
+            self._iplayer_running = False
+        self.log("IPLayerCapacity poller stopped")
+
     def log(self, message: str):
         """Add log message"""
         timestamp = time.strftime('%H:%M:%S')
@@ -2015,6 +2247,18 @@ def _on_usp_event(event: dict):
             except Exception:
                 event["previous_value"] = None
             controller._update_model_value(path, event.get("value", ""))
+
+        # IPLayerCapacity incremental results
+        sub_id = event.get("subscription_id", "")
+        if sub_id in ("sub-iplayer-incremental", "iplayer-incr-result") and "IPLayerCapacity" in event.get("event_name", ""):
+            with controller._iplayer_lock:
+                controller._iplayer_results.append(event.get("params", {}))
+
+        elif sub_id in ("sub-iplayer-complete", "iplayer-complete"):
+            # OperationComplete carries output_args with final summary
+            with controller._iplayer_lock:
+                controller._iplayer_summary = event.get("output_args", {})
+                controller._iplayer_running = False
 
         # Store event (max 500)
         with controller._events_lock:
@@ -2937,6 +3181,48 @@ def api_diagnostics_health():
     })
 
 
+@app.route('/api/diagnostics/iplayer_capacity', methods=['POST'])
+def api_iplayer_capacity_run():
+    """
+    Trigger Device.IP.Diagnostics.IPLayerCapacity() and subscribe for
+    incremental results via USP events (sub-iplayer-incremental).
+
+    Accepted JSON body fields (all optional):
+      ServerList, Role, ProtocolVersion, IPDVEnable, IPRREnable, RIPREnable,
+      MaximumTestBandwidth, NumberTestSubIntervals,
+      NumberFirstModeTestSubIntervals, TestSubInterval,
+      StatusFeedbackInterval, RateAdjAlgorithm
+    """
+    data = request.get_json(silent=True) or {}
+    result = controller.run_iplayer_capacity(data)
+    return jsonify(result)
+
+
+@app.route('/api/diagnostics/iplayer_capacity/results')
+def api_iplayer_capacity_results():
+    """
+    Return accumulated incremental results and summary so far.
+    Poll this endpoint every ~1 s while running==True.
+    """
+    with controller._iplayer_lock:
+        return jsonify({
+            'running':          controller._iplayer_running,
+            'incremental':      list(controller._iplayer_results),
+            'summary':          dict(controller._iplayer_summary),
+            'result_count':     len(controller._iplayer_results),
+        })
+
+
+@app.route('/api/diagnostics/iplayer_capacity/clear', methods=['POST'])
+def api_iplayer_capacity_clear():
+    """Clear stored incremental results and summary."""
+    with controller._iplayer_lock:
+        controller._iplayer_results.clear()
+        controller._iplayer_summary = {}
+        controller._iplayer_running = False
+    return jsonify({'success': True})
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4. Location Routes
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3248,7 +3534,7 @@ def _load_cpe_registry() -> list:
             pass
     return [
         {'id': 'cpe-001', 'serial': 'RDK-001234', 'model': 'RDK-B Gateway', 'firmware': '5.4.0.0',
-         'ip': '10.2.175.86', 'agent_id': 'proto::rx_usp_agent_mqtt', 'status': 'Online',
+         'ip': '10.26.69.240', 'agent_id': 'proto::rx_usp_agent_mqtt', 'status': 'Online',
          'last_seen': 'Just now', 'friendly_name': 'Lab Gateway', 'tags': ['lab']},
         {'id': 'cpe-002', 'serial': 'RDK-005678', 'model': 'RDK-B Access Point', 'firmware': '5.3.1.0',
          'ip': '10.2.175.87', 'agent_id': 'proto::rx_usp_agent_mqtt_2', 'status': 'Offline',

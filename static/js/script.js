@@ -3221,3 +3221,52 @@ window.cpeRemoveByIdx = cpeRemoveByIdx;
 window.cpeSwitchActive = cpeSwitchActive;
 window.cpeCompare = cpeCompare;
 window.cpeFilterByTag = cpeFilterByTag;
+
+// ── IPLayerCapacity quick trigger from USP Events section ─────────────────
+async function evtUdpstTrigger() {
+  const btn    = document.getElementById('evt-udpst-btn');
+  const status = document.getElementById('evt-udpst-status');
+
+  const params = {
+    ServerList:                      document.getElementById('evt-udpst-server').value.trim(),
+    Role:                            document.getElementById('evt-udpst-role').value,
+    ProtocolVersion:                 document.getElementById('evt-udpst-proto').value,
+    NumberTestSubIntervals:          document.getElementById('evt-udpst-intervals').value,
+    NumberFirstModeTestSubIntervals: document.getElementById('evt-udpst-firstmode').value,
+    MaximumTestBandwidth:            document.getElementById('evt-udpst-bw').value,
+    IPDVEnable:  document.getElementById('evt-udpst-ipdv').checked ? 'true' : 'false',
+    IPRREnable:  document.getElementById('evt-udpst-iprr').checked ? 'true' : 'false',
+    RIPREnable:  document.getElementById('evt-udpst-ripr').checked ? 'true' : 'false',
+  };
+
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sending…';
+  status.style.display = 'block';
+  status.style.color   = 'var(--text-muted)';
+  status.textContent   = '→ Sending USP operate to agent…';
+
+  try {
+    const resp = await fetch('/api/diagnostics/iplayer_capacity', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const data = await resp.json();
+
+    if (data.success) {
+      const reqPath = data.result?.operationResults?.[0]?.reqObjPath || 'async started';
+      status.style.color = 'var(--status-online)';
+      status.textContent = `✓ Accepted — ${reqPath}  |  Watch events below for IncrementalResult and OperationComplete`;
+    } else {
+      status.style.color = 'var(--status-offline)';
+      status.textContent = '✗ ' + (data.error || 'Failed');
+    }
+  } catch (err) {
+    status.style.color = 'var(--status-offline)';
+    status.textContent = '✗ ' + err.message;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-play"></i> Run Test';
+  }
+}
+window.evtUdpstTrigger = evtUdpstTrigger;

@@ -1337,6 +1337,60 @@
         </div>
 
             <!-- ============================================================ -->
+            <!-- IPLayerCapacity Quick Trigger                                 -->
+            <!-- ============================================================ -->
+            <section class="panel full-width" style="margin-bottom:16px;">
+              <div class="panel-title"><i class="fas fa-tachometer-alt"></i> TR-471 IPLayerCapacity — Quick Trigger</div>
+              <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;">
+                <div>
+                  <label style="font-size:12px;display:block;margin-bottom:4px;">Server List</label>
+                  <input class="form-control" id="evt-udpst-server" value="10.26.69.240:25000" style="width:180px;font-size:12px;">
+                </div>
+                <div>
+                  <label style="font-size:12px;display:block;margin-bottom:4px;">Role</label>
+                  <select class="form-control" id="evt-udpst-role" style="width:110px;font-size:12px;">
+                    <option value="Receiver" selected>Receiver</option>
+                    <option value="Sender">Sender</option>
+                  </select>
+                </div>
+                <div>
+                  <label style="font-size:12px;display:block;margin-bottom:4px;">Sub-Intervals</label>
+                  <input class="form-control" id="evt-udpst-intervals" type="number" value="10" min="1" max="3600" style="width:80px;font-size:12px;">
+                </div>
+                <div>
+                  <label style="font-size:12px;display:block;margin-bottom:4px;">First Mode <span style="color:var(--accent-secondary);font-size:10px;">(bimodal)</span></label>
+                  <input class="form-control" id="evt-udpst-firstmode" type="number" value="5" min="0" max="3600" style="width:80px;font-size:12px;">
+                </div>
+                <div>
+                  <label style="font-size:12px;display:block;margin-bottom:4px;">Max BW (Mbps)</label>
+                  <input class="form-control" id="evt-udpst-bw" type="number" value="1000" min="0" style="width:90px;font-size:12px;">
+                </div>
+                <div>
+                  <label style="font-size:12px;display:block;margin-bottom:4px;">Protocol</label>
+                  <select class="form-control" id="evt-udpst-proto" style="width:80px;font-size:12px;">
+                    <option value="IPv4" selected>IPv4</option>
+                    <option value="IPv6">IPv6</option>
+                    <option value="Any">Any</option>
+                  </select>
+                </div>
+                <div style="display:flex;align-items:center;gap:12px;padding-bottom:2px;">
+                  <label style="font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer;">
+                    <input type="checkbox" id="evt-udpst-ipdv" checked> IPDV
+                  </label>
+                  <label style="font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer;">
+                    <input type="checkbox" id="evt-udpst-iprr" checked> IPRR
+                  </label>
+                  <label style="font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer;">
+                    <input type="checkbox" id="evt-udpst-ripr" checked> RIPR
+                  </label>
+                </div>
+                <button id="evt-udpst-btn" class="btn btn-success" onclick="evtUdpstTrigger()" style="white-space:nowrap;">
+                  <i class="fas fa-play"></i> Run Test
+                </button>
+              </div>
+              <!-- Status line -->
+              <div id="evt-udpst-status" style="margin-top:10px;font-size:12px;color:var(--text-muted);display:none;padding:6px 10px;background:var(--tertiary-bg);border-radius:6px;"></div>
+            </section>
             <!-- USP Events Panel                                              -->
             <!-- ============================================================ -->
             <section class="panel full-width" id="events-panel">
